@@ -1,67 +1,135 @@
-# Base RPC Getting Started
+# Base RPC: Canonical State, Pending State, and Fee-Aware Reads
 
-This guide covers connecting to Base Mainnet and making Ethereum-compatible JSON-RPC calls.
+Base exposes an Ethereum-compatible JSON-RPC API, but current Base documentation adds useful L2-specific semantics around block tags and pre-confirmed state. This guide keeps the main path on a standard Base RPC endpoint and calls out where Base's separate Flashblocks interface changes the meaning of `pending`.
 
-## RPC endpoint
-
-```text
-https://base.api.onfinality.io/public
-```
-
-Base is an OP Stack Layer 2 with chain ID `8453`.
-
-## 1. Verify the network
+For standard Base Mainnet RPC calls:
 
 ```bash
-curl -s https://base.api.onfinality.io/public \
+export BASE_RPC=https://base.api.onfinality.io/public
+```
+
+Base Mainnet chain ID is `8453` (`0x2105`).
+
+## First verify the chain
+
+```bash
+curl -s "$BASE_RPC" \
   -H 'content-type: application/json' \
   --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
 ```
 
-Base Mainnet returns `0x2105`.
+Expected result:
 
-## 2. Get the latest block
-
-```bash
-curl -s https://base.api.onfinality.io/public \
-  -H 'content-type: application/json' \
-  --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+```json
+{"jsonrpc":"2.0","id":1,"result":"0x2105"}
 ```
 
-## 3. Read ETH balance
+## Read the chain at the confirmation level you actually need
+
+Base's JSON-RPC documentation accepts the familiar EVM block tags such as `latest`, `safe`, and `finalized` on state/block methods.
+
+Latest block:
 
 ```bash
-curl -s https://base.api.onfinality.io/public \
+curl -s "$BASE_RPC" \
   -H 'content-type: application/json' \
   --data '{
     "jsonrpc":"2.0",
     "id":1,
-    "method":"eth_getBalance",
+    "method":"eth_getBlockByNumber",
+    "params":["latest",false]
+  }'
+```
+
+Safer view:
+
+```bash
+curl -s "$BASE_RPC" \
+  -H 'content-type: application/json' \
+  --data '{
+    "jsonrpc":"2.0",
+    "id":1,
+    "method":"eth_getBlockByNumber",
+    "params":["safe",false]
+  }'
+```
+
+For an application, this is more expressive than using "latest minus N blocks" everywhere.
+
+## Nonces: `latest` and `pending` answer different questions
+
+The next nonce for an account comes from `eth_getTransactionCount`.
+
+```bash
+curl -s "$BASE_RPC" \
+  -H 'content-type: application/json' \
+  --data '{
+    "jsonrpc":"2.0",
+    "id":1,
+    "method":"eth_getTransactionCount",
     "params":["0xYOUR_ADDRESS","latest"]
   }'
 ```
 
-ETH is the native gas token on Base.
+`latest` is appropriate when you want the nonce derived from confirmed chain state.
 
-## 4. Inspect recent fee history
+Base also operates a separate Flashblocks/pre-confirmation endpoint. Base's documentation notes that querying that interface with the `pending` tag can include pre-confirmed transactions. Do not assume a normal provider endpoint and a Flashblocks endpoint expose identical `pending` semantics.
+
+That distinction matters for high-frequency transaction senders: a stale nonce view can create nonce gaps or replacement conflicts.
+
+## Read Base fee history
+
+Base supports Ethereum-style fee RPC methods. `eth_feeHistory` is useful when building a fee estimator from recent blocks:
 
 ```bash
-curl -s https://base.api.onfinality.io/public \
+curl -s "$BASE_RPC" \
   -H 'content-type: application/json' \
   --data '{
     "jsonrpc":"2.0",
     "id":1,
     "method":"eth_feeHistory",
-    "params":["0x5","latest",[25,50,75]]
+    "params":["0xA","latest",[10,50,90]]
   }'
 ```
 
-`eth_feeHistory` is useful when building fee-aware EIP-1559-style transactions.
-
-## 5. Make a read-only contract call
+You can also query a suggested priority fee:
 
 ```bash
-curl -s https://base.api.onfinality.io/public \
+curl -s "$BASE_RPC" \
+  -H 'content-type: application/json' \
+  --data '{
+    "jsonrpc":"2.0",
+    "id":1,
+    "method":"eth_maxPriorityFeePerGas",
+    "params":[]
+  }'
+```
+
+Fee-related methods help construct the L2 transaction, but an L2's total transaction economics should not be assumed to be identical to Ethereum Mainnet.
+
+## Pull every receipt for one block
+
+Base documents `eth_getBlockReceipts`, which is convenient for block-oriented pipelines:
+
+```bash
+curl -s "$BASE_RPC" \
+  -H 'content-type: application/json' \
+  --data '{
+    "jsonrpc":"2.0",
+    "id":1,
+    "method":"eth_getBlockReceipts",
+    "params":["latest"]
+  }'
+```
+
+For an indexer that needs every receipt anyway, this can be more natural than fetching each transaction receipt one by one. Provider support and response-size limits can still vary, so production code should handle method/provider capability differences.
+
+## Contract reads and logs are ordinary EVM calls
+
+Read contract state:
+
+```bash
+curl -s "$BASE_RPC" \
   -H 'content-type: application/json' \
   --data '{
     "jsonrpc":"2.0",
@@ -74,10 +142,10 @@ curl -s https://base.api.onfinality.io/public \
   }'
 ```
 
-## 6. Query logs
+Query logs:
 
 ```bash
-curl -s https://base.api.onfinality.io/public \
+curl -s "$BASE_RPC" \
   -H 'content-type: application/json' \
   --data '{
     "jsonrpc":"2.0",
@@ -85,62 +153,52 @@ curl -s https://base.api.onfinality.io/public \
     "method":"eth_getLogs",
     "params":[{
       "fromBlock":"0xSTART_BLOCK",
-      "toBlock":"latest",
+      "toBlock":"0xEND_BLOCK",
       "address":"0xCONTRACT_ADDRESS"
     }]
   }'
 ```
 
-For indexers, use bounded ranges and checkpoint the last processed block.
+If you are building an indexer, use bounded ranges and store a checkpoint. L2 chains can advance quickly enough that "scan from genesis to latest" is not a sensible recurring query.
 
-## 7. JavaScript example
+## Use Base's chain definition with viem
 
-```js
-const RPC_URL = 'https://base.api.onfinality.io/public';
-
-async function rpc(method, params = []) {
-  const res = await fetch(RPC_URL, {
-    method: 'POST',
-    headers: {'content-type': 'application/json'},
-    body: JSON.stringify({jsonrpc: '2.0', id: 1, method, params}),
-  });
-
-  const body = await res.json();
-  if (body.error) throw new Error(body.error.message);
-  return body.result;
-}
-
-const chainId = Number.parseInt(await rpc('eth_chainId'), 16);
-const block = Number.parseInt(await rpc('eth_blockNumber'), 16);
-console.log({chainId, block});
+```bash
+npm install viem
 ```
 
-## Troubleshooting
+```js
+import {createPublicClient, http} from 'viem';
+import {base} from 'viem/chains';
 
-### Contract works on Ethereum but fails on Base
+const client = createPublicClient({
+  chain: base,
+  transport: http('https://base.api.onfinality.io/public'),
+});
 
-Deployment addresses and state are chain-specific. Verify the contract is actually deployed on Base.
+const [chainId, blockNumber, gasPrice] = await Promise.all([
+  client.getChainId(),
+  client.getBlockNumber(),
+  client.getGasPrice(),
+]);
 
-### Large log queries fail
+console.log({chainId, blockNumber, gasPrice});
+```
 
-Reduce the block range and retry smaller windows.
+Using a chain definition also gives wallet tooling the correct chain ID, native currency metadata, and explorer defaults.
 
-### Fee assumptions are wrong
+## Standard RPC vs Flashblocks
 
-Base is an L2. Do not assume total transaction-cost behavior is identical to Ethereum Mainnet simply because the RPC interface is compatible.
+They solve different problems:
 
-## Mainnet settings
+- **Standard RPC** is the general interface for blocks, state, logs, simulation, receipts, and normal application traffic.
+- **Flashblocks/pre-confirmation RPC** is for applications that explicitly need Base's faster pre-confirmed view of pending state.
 
-| Setting | Value |
-| --- | --- |
-| Network | Base Mainnet |
-| Chain ID | `8453` |
-| Native token | ETH |
-| RPC | `https://base.api.onfinality.io/public` |
-| Explorer | `https://basescan.org` |
+This repository uses the standard path because it is the portable default. If your application depends on sub-block latency, read Base's Flashblocks documentation and design the state machine around the weaker confirmation guarantee instead of silently treating pre-confirmation as finality.
 
-## Resources
+## References
 
+- [Base Ethereum JSON-RPC API](https://docs.base.org/base-chain/api-reference/ethereum-json-rpc-api/eth_chainId)
 - [Base documentation](https://docs.base.org/)
 - [OnFinality Base RPC](https://onfinality.io/en/networks/base)
-- [OnFinality RPC network directory](https://onfinality.io/en/networks)
+- [OnFinality network directory](https://onfinality.io/en/networks)
